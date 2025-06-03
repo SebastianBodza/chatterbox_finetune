@@ -18,7 +18,7 @@ from .llama_configs import LLAMA_CONFIGS
 from .inference.t3_hf_backend import T3HuggingfaceBackend
 from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
 
-
+from torch.nn import CrossEntropyLoss
 logger = logging.getLogger(__name__)
 
 
@@ -89,13 +89,11 @@ class T3(nn.Module):
         t3_cond: T3Cond,
         text_tokens: torch.LongTensor,
         speech_tokens: torch.LongTensor,
-        cfg_weight: float = 0.0,
     ):
         # prepare input embeddings (skip backbone tranformer embeddings)
         cond_emb = self.prepare_conditioning(t3_cond)  # (B, len_cond, dim)
         text_emb = self.text_emb(text_tokens)  # (B, len_text, dim)
-        if cfg_weight > 0.0:
-            text_emb[1].zero_()  # CFG uncond
+        # text_emb[1].zero_()  # CFG uncond
 
         speech_emb = self.speech_emb(speech_tokens)  # (B, len_speech, dim)
         if self.hp.input_pos_emb == "learned":
@@ -116,18 +114,31 @@ class T3(nn.Module):
     def forward(
         self,
         *,
-        t3_cond: T3Cond,
         text_tokens: torch.LongTensor,
         text_token_lens: torch.LongTensor,
         speech_tokens: torch.LongTensor,
         speech_token_lens: torch.LongTensor,
+        speaker_embed: torch.Tensor, 
+        cond_prompt_speech_tokens: Optional[torch.LongTensor] = None, 
+        t3_cond: Optional[T3Cond] = None,
+        return_dict: Optional[bool] = None,
         training=False,
     ):
         _ensure_BOT_EOT(text_tokens, self.hp)
+    
+        t3_cond_input = None
+        if (speaker_embed is not None ): 
+            t3_cond_input = T3Cond(
+                speaker_emb=speaker_embed,
+                cond_prompt_speech_tokens=cond_prompt_speech_tokens,
+                emotion_adv=t3_cond.emotion_adv if t3_cond is not None else 0.5 * torch.ones(1, 1, 1, device=self.device),
+                clap_emb=t3_cond.clap_emb if t3_cond is not None else None,
+                cond_prompt_speech_emb=t3_cond.cond_prompt_speech_emb if t3_cond is not None else None,
+            )
 
         # prepare custom input embeds
         embeds, len_cond = self.prepare_input_embeds(
-            t3_cond=t3_cond,
+            t3_cond=t3_cond_input or t3_cond,
             text_tokens=text_tokens,
             speech_tokens=speech_tokens,
         )
@@ -162,12 +173,46 @@ class T3(nn.Module):
         text_logits = self.text_head(text_latents)
         speech_logits = self.speech_head(speech_latents)
 
+        total_loss = None 
+        if self.training: 
+
+            loss_speech_logits = speech_logits[..., :-1, :].contiguous()
+            loss_speech_targets = speech_tokens[..., 1:].contiguous()
+
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+
+            loss_speech_logits = loss_speech_logits.view(-1, loss_speech_logits.size(-1))
+            loss_speech_targets = loss_speech_targets.view(-1)
+            loss_speech_targets = loss_speech_targets.to(device) 
+
+            loss_speech = loss_fct(loss_speech_logits, loss_speech_targets)
+
+            loss_text_logits = text_logits[..., :-1, :].contiguous()
+            loss_text_targets = text_tokens[..., 1:].contiguous()
+
+            loss_fct_text = CrossEntropyLoss(ignore_index=-100)
+
+            loss_text_logits = loss_text_logits.view(-1, loss_text_logits.size(-1))
+            loss_text_targets = loss_text_targets.view(-1)
+            loss_text_targets = loss_text_targets.to(device)  
+            
+            loss_text = loss_fct_text(loss_text_logits, loss_text_targets)
+            total_loss = (loss_speech + loss_text) / 2
+
+        _return_dict = return_dict if return_dict is not None else True
+        if not _return_dict:
+            outputs = (text_logits, speech_logits)
+            if total_loss is not None:
+                outputs = (total_loss,) + outputs
+                return outputs
+        
         return AttrDict(
             text_logits=text_logits,
             text_latents=text_latents,
             speech_logits=speech_logits,
             speech_latents=speech_latents,
             hidden_states=hidden_states,
+            loss = total_loss
         )
 
     def loss(
@@ -246,7 +291,6 @@ class T3(nn.Module):
             t3_cond=t3_cond,
             text_tokens=text_tokens,
             speech_tokens=initial_speech_tokens,
-            cfg_weight=cfg_weight,
         )
 
         # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
@@ -300,11 +344,8 @@ class T3(nn.Module):
         # batch_size=2 for CFG
         bos_embed = torch.cat([bos_embed, bos_embed])
 
-        # Combine condition and BOS token for the initial input if cfg_weight > 0
-        if cfg_weight > 0:
-            inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
-        else:
-            inputs_embeds = embeds
+        # Combine condition and BOS token for the initial input
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
 
         # Track generated token ids; start with the BOS token.
         generated_ids = bos_token.clone()
@@ -331,11 +372,9 @@ class T3(nn.Module):
             logits = output.logits[:, -1, :]
 
             # CFG
-            if cfg_weight > 0.0:
-                logits_cond = logits[0:1]
-                logits_uncond = logits[1:2]
-                logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
-
+            logits_cond = logits[0:1]
+            logits_uncond = logits[1:2]
+            logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
             logits = logits.squeeze(1)
 
             # Apply temperature scaling.
@@ -362,8 +401,7 @@ class T3(nn.Module):
             next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
 
             #  For CFG
-            if cfg_weight > 0.0:
-                next_token_embed = torch.cat([next_token_embed, next_token_embed])
+            next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
             # Forward pass with only the new token and the cached past.
             output = self.patched_model(
