@@ -18,7 +18,8 @@ from .llama_configs import LLAMA_CONFIGS
 from .inference.t3_hf_backend import T3HuggingfaceBackend
 from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
 
-from torch.nn import CrossEntropyLoss
+from liger_kernel.transformers.experimental import LigerEmbedding
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,8 +55,8 @@ class T3(nn.Module):
 
         # conditioning / embedding
         self.cond_enc = T3CondEnc(hp)
-        self.text_emb = nn.Embedding(hp.text_tokens_dict_size, self.dim)
-        self.speech_emb = nn.Embedding(hp.speech_tokens_dict_size, self.dim)
+        self.text_emb = LigerEmbedding(hp.text_tokens_dict_size, self.dim)
+        self.speech_emb = LigerEmbedding(hp.speech_tokens_dict_size, self.dim)
 
         # custom position embedding
         if hp.input_pos_emb == "learned":
@@ -173,38 +174,6 @@ class T3(nn.Module):
         text_logits = self.text_head(text_latents)
         speech_logits = self.speech_head(speech_latents)
 
-        total_loss = None 
-        if self.training: 
-
-            loss_speech_logits = speech_logits[..., :-1, :].contiguous()
-            loss_speech_targets = speech_tokens[..., 1:].contiguous()
-
-            loss_fct = CrossEntropyLoss(ignore_index=-100)
-
-            loss_speech_logits = loss_speech_logits.view(-1, loss_speech_logits.size(-1))
-            loss_speech_targets = loss_speech_targets.view(-1)
-            loss_speech_targets = loss_speech_targets.to(device) 
-
-            loss_speech = loss_fct(loss_speech_logits, loss_speech_targets)
-
-            loss_text_logits = text_logits[..., :-1, :].contiguous()
-            loss_text_targets = text_tokens[..., 1:].contiguous()
-
-            loss_fct_text = CrossEntropyLoss(ignore_index=-100)
-
-            loss_text_logits = loss_text_logits.view(-1, loss_text_logits.size(-1))
-            loss_text_targets = loss_text_targets.view(-1)
-            loss_text_targets = loss_text_targets.to(device)  
-            
-            loss_text = loss_fct_text(loss_text_logits, loss_text_targets)
-            total_loss = (loss_speech + loss_text) / 2
-
-        _return_dict = return_dict if return_dict is not None else True
-        if not _return_dict:
-            outputs = (text_logits, speech_logits)
-            if total_loss is not None:
-                outputs = (total_loss,) + outputs
-                return outputs
         
         return AttrDict(
             text_logits=text_logits,
@@ -212,7 +181,6 @@ class T3(nn.Module):
             speech_logits=speech_logits,
             speech_latents=speech_latents,
             hidden_states=hidden_states,
-            loss = total_loss
         )
 
     def loss(
